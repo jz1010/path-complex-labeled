@@ -1,5 +1,11 @@
 # path-complex-labeled
 
+## Mod 2 vs integer coefficients
+
+The notebook defines `BOUNDARY_MOD2` (default **True**) in the same cell as `substitute` / `reduceconf`. When **True**, chain coefficients are reduced mod 2 throughout `reduceconf`, `redboundary`, and `makebdrydict_unordered`, and `ranks` builds boundary matrices over **GF(2)** so `rank` is the F₂-rank (mod-2 Betti numbers). Set **`BOUNDARY_MOD2 = False`** for the original integer / rational behavior.
+
+After toggling `BOUNDARY_MOD2`, re-run **`startconfdict`** and **`makebdrydict`** (and any unordered cells) from scratch.
+
 ## How to run the code to create unordered matrices
 
 ### 1. Run the ordered pipeline first (once per n)
