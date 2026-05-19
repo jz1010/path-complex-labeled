@@ -1,7 +1,9 @@
 import functools
 import gc
+import math
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from sage.all import GF, matrix, rank
 
@@ -136,15 +138,167 @@ def dimconf(conf):
     return sum([(conf[x])[0] + (conf[x])[1] for x in conf])
 
 
-def ucrits(n):
+@functools.lru_cache(maxsize=None)
+def _grid_corner_coords(n):
+    """Precomputed mattopasc coordinates for each index in the n×n grid."""
+    return tuple(mattopasc((i // n, i % n)) for i in range(n * n))
+
+
+def _corners_from_mask(mask, coords):
+    return frozenset(coords[i] for i in range(len(coords)) if (mask >> i) & 1)
+
+
+def _iter_k_subset_masks(nn, k):
+    """Yield integers with exactly k bits set among nn bits (same set as choices(nn, k))."""
+    if k < 0 or k > nn:
+        return
+    if k == 0:
+        yield 0
+        return
+    x = (1 << k) - 1
+    limit = 1 << nn
+    while x < limit:
+        yield x
+        c = x & -x
+        r = x + c
+        if r >= limit:
+            break
+        x = (((r ^ x) >> 2) // c) | r
+
+
+def _comb_unrank_mask(nn, k, rank):
+    """Lexicographic rank of a k-subset of range(nn) as a bitmask."""
+    indices = []
+    for i in range(nn):
+        if k == 0:
+            break
+        c = math.comb(nn - i - 1, k - 1)
+        if rank < c:
+            indices.append(i)
+            k -= 1
+        else:
+            rank -= c
+    mask = 0
+    for i in indices:
+        mask |= 1 << i
+    return mask
+
+
+def _lex_next_mask(mask, nn, k):
+    """Next k-subset mask in the same order as itertools.combinations(range(nn), k)."""
+    idx = [i for i in range(nn) if (mask >> i) & 1]
+    for j in range(k - 1, -1, -1):
+        if idx[j] < nn - k + j:
+            idx[j] += 1
+            for t in range(j + 1, k):
+                idx[t] = idx[t - 1] + 1
+            out = 0
+            for i in idx:
+                out |= 1 << i
+            return out
+    return None
+
+
+def _ucrits_progress_enabled(progress):
+    if not progress:
+        return False
+    return os.environ.get("PATH_COMPLEX_NO_UCRITS_PROGRESS", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _ucrits_serial(n, progress=False):
+    """Enumerate all corner masks without materializing choices(n^2, n)."""
     ans = [[] for _ in range(n)]
-    for num in choices(n ** 2, n):
-        corners = bitstoset(n, num)
+    nn = n * n
+    k = n
+    coords = _grid_corner_coords(n)
+    total = math.comb(nn, k)
+    show = _ucrits_progress_enabled(progress)
+    width = 40
+    last_bucket = -1
+    for i, num in enumerate(_iter_k_subset_masks(nn, k)):
+        corners = _corners_from_mask(num, coords)
         paths = findfast(corners)
         if paths is not None:
             uconf = crituconf(corners, paths)
             ans[dimconf(uconf)].append(uconf)
+        if show and total > 0:
+            bucket = (i * width) // total
+            if bucket > last_bucket:
+                last_bucket = bucket
+                _terminal_progress_bar("ucrits", i, total)
+    if show and total > 0:
+        _terminal_progress_bar("ucrits", total - 1, total)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
     return ans
+
+
+def _ucrits_lex_chunk(n, start_rank, count):
+    """Process count masks starting at lexicographic rank start_rank (for parallel chunks)."""
+    ans = [[] for _ in range(n)]
+    if count <= 0:
+        return ans
+    nn = n * n
+    k = n
+    coords = _grid_corner_coords(n)
+    num = _comb_unrank_mask(nn, k, start_rank)
+    for _ in range(count):
+        corners = _corners_from_mask(num, coords)
+        paths = findfast(corners)
+        if paths is not None:
+            uconf = crituconf(corners, paths)
+            ans[dimconf(uconf)].append(uconf)
+        nxt = _lex_next_mask(num, nn, k)
+        if nxt is None:
+            break
+        num = nxt
+    return ans
+
+
+def _ucrits_worker(args):
+    n, start_rank, count = args
+    return _ucrits_lex_chunk(n, start_rank, count)
+
+
+def ucrits(n, progress=False):
+    nn = n * n
+    k = n
+    workers = int(os.environ.get("PATH_COMPLEX_UCRITS_WORKERS", "0") or "0")
+    total = math.comb(nn, k)
+    if workers <= 1 or total == 0:
+        return _ucrits_serial(n, progress=progress)
+    workers = min(workers, total)
+    chunk = (total + workers - 1) // workers
+    tasks = []
+    for w in range(workers):
+        start = w * chunk
+        count = min(chunk, total - start)
+        if count:
+            tasks.append((n, start, count))
+    show = _ucrits_progress_enabled(progress)
+    with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
+        if show:
+            parts = []
+            futs = [pool.submit(_ucrits_worker, t) for t in tasks]
+            done = 0
+            n_tasks = len(futs)
+            for fut in as_completed(futs):
+                parts.append(fut.result())
+                _terminal_progress_bar("ucrits", done, n_tasks)
+                done += 1
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            parts = list(pool.map(_ucrits_worker, tasks))
+    merged = [[] for _ in range(n)]
+    for part in parts:
+        for d in range(n):
+            merged[d].extend(part[d])
+    return merged
 
 
 @functools.lru_cache(maxsize=2**17)
@@ -418,17 +572,17 @@ def redboundary(crconf, confdict, bdrydict, permlist=None):
     return chain
 
 
-def _bdrydict_progress_bar(done, total, width=40, file=None):
+def _terminal_progress_bar(label, done, total, width=40, file=None):
     """Single-line terminal bar on stderr (no extra dependencies)."""
     if file is None:
         file = sys.stderr
     if total <= 0:
-        line = "\rmakebdrydict [done] 0/0"
+        line = f"\r{label} [done] 0/0"
     else:
         frac = min(1.0, (done + 1) / total)
         filled = int(width * frac)
         bar = "#" * filled + "-" * (width - filled)
-        line = f"\rmakebdrydict [{bar}] {done + 1}/{total}"
+        line = f"\r{label} [{bar}] {done + 1}/{total}"
     file.write(line)
     file.flush()
 
@@ -463,7 +617,7 @@ def makebdrydict(ucritlist, confdict, progress=False, permlist=None):
         if gc_every and (i + 1) % gc_every == 0:
             gc.collect()
         if progress:
-            _bdrydict_progress_bar(i, total)
+            _terminal_progress_bar("makebdrydict", i, total)
 
     if progress and total > 0:
         env_off = os.environ.get("PATH_COMPLEX_NO_BDRY_PROGRESS", "").strip().lower() in (
@@ -539,7 +693,7 @@ def _progress(message, verbose):
 def build_complex_data(n, verbose=False):
     """Build ucrits, confdict, and bdrydict using the unordered (unlabeled-key) pipeline."""
     _progress(f"[n={n}] building critical cells (ucrits)", verbose)
-    crits = ucrits(n)
+    crits = ucrits(n, progress=verbose)
     _progress(f"[n={n}] building confdict (startconfdict)", verbose)
     confdict = startconfdict(crits)
     _progress(f"[n={n}] building bdrydict (makebdrydict)", verbose)
@@ -593,6 +747,8 @@ def _named_complex_data(n, verbose=False):
         4: "four",
         5: "five",
         6: "six",
+        7: "seven",
+        8: "eight",
     }
     prefix = names.get(n, str(n))
     return {
