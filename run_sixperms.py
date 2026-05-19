@@ -1,14 +1,24 @@
+import time
+
 from path_complex_lib import initialize_notebook_state, rectangle_summary
 
 
-state = initialize_notebook_state(6, verbose=True)
-sixcrits = state["sixcrits"]
-sixperms = state["sixperms"]
-confdict6 = state["confdict6"]
-bdrydict6 = state["bdrydict6"]
-
-
 if __name__ == "__main__":
+    t0 = time.perf_counter()
+    state = initialize_notebook_state(6, verbose=True)
+    sixcrits = state["sixcrits"]
+    confdict6 = state["confdict6"]
+    bdrydict6 = state["bdrydict6"]
+
+    _, r6, c6, b6 = rectangle_summary(
+        sixcrits,
+        bdrydict6,
+        6,
+        6,
+        verbose=True,
+        label="sixperms",
+    )
+    print(r6, c6, b6)
     rects = [
         (1, 6),
         (2, 6),
@@ -27,13 +37,13 @@ if __name__ == "__main__":
         (3, 3),
     ]
     for rec in rects:
-        f, r, c, b = rectangle_summary(
+        _, r, c, b = rectangle_summary(
             sixcrits,
-            sixperms,
             bdrydict6,
             rec[0],
             rec[1],
-            verbose=True,
-            label="sixperms",
         )
         print("p=", rec[0], ", q=", rec[1], ": ", r, c, b)
+
+    elapsed = time.perf_counter() - t0
+    print("sixperms wall time:", round(elapsed, 3), "s")
